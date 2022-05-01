@@ -1,0 +1,188 @@
+/*
+ * JBoss, the OpenSource J2EE webOS
+ *
+ * Distributable under LGPL license.
+ * See terms of license at gnu.org.
+ */
+package org.jboss.cache.aop.old;
+
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+import org.jboss.aop.InstanceAdvisor;
+import org.jboss.aop.Advised;
+import org.jboss.aop.advice.Interceptor;
+import org.jboss.aop.joinpoint.Invocation;
+import org.jboss.aop.joinpoint.MethodInvocation;
+import org.jboss.aop.proxy.ClassProxy;
+import org.jboss.aop.proxy.ClassProxyFactory;
+import org.jboss.aop.util.MethodHashing;
+import org.jboss.util.NestedRuntimeException;
+import org.jboss.cache.Fqn;
+import org.jboss.cache.CacheException;
+import org.jboss.cache.GlobalTransaction;
+
+import java.lang.reflect.Method;
+import java.util.HashMap;
+import java.util.Map;
+import java.io.Serializable;
+
+/**
+ * AopCache delegation to handle internal cache sotre, that is, the portion that is not part of user's data.
+ *
+ * @author Ben Wang
+ */
+public class InternalDelegate
+{
+   static Log log=LogFactory.getLog(InternalDelegate.class.getName());
+   public static final String CLASS_INTERNAL = "__jboss:internal:class__";
+   public static final String SERIALIZED = "__SERIALIZED__";
+   public static final Fqn JBOSS_INTERNAL = new Fqn("__JBossInternal__");
+   // We will try to break up the AopInstance inside the cache store.
+   public static final String AOPINSTANCE_REF_COUNT = "__AOPINSTANCE_COUNT__";
+   public static final String AOPINSTANCE_REF_FQN = "__AOPINSTANCE_FQN__";
+   // This is the key to store the pojo instance. But this is not replicated instead local only.
+   public static final String AOPINSTANCE_POJO = "__AOPINSTANCE_POJO__";
+
+   protected TreeCacheAop cache_;
+
+   InternalDelegate(TreeCacheAop cache)
+   {
+      cache_ = cache;
+   }
+
+   protected AOPInstance getAopInstance(Fqn fqn) throws CacheException
+   {
+      // Not very efficient now since we are peeking every single time. Should have cache it without going to
+      // local cache.
+      return (AOPInstance)cache_.peek(fqn, AOPInstance.KEY);
+   }
+
+   void resetRefCount(Fqn fqn) throws CacheException
+   {
+      AOPInstance aopInstance = getAopInstance(fqn);
+
+      if(aopInstance == null)
+         aopInstance = new AOPInstance();
+
+      aopInstance.incrementRefCount();
+      cache_.put(fqn, AOPInstance.KEY, aopInstance);
+   }
+
+   /**
+    * Increment reference count for the pojo. Note that this is not thread safe or atomic.
+    */
+   int incrementRefCount(Fqn fqn) throws CacheException
+   {
+      AOPInstance aopInstance = getAopInstance(fqn);
+      if(aopInstance == null)
+         throw new RuntimeException("InternalDelegate.incrementRefCount(): null aopInstance.");
+
+      int count = aopInstance.incrementRefCount();
+      // need to update it.
+      cache_.put(fqn, AOPInstance.KEY, aopInstance);
+      return count;
+   }
+
+   /**
+    * decrement reference count for the pojo. Note that this is not thread safe or atomic.
+    */
+   int decrementRefCount(Fqn fqn) throws CacheException
+   {
+      AOPInstance aopInstance = getAopInstance(fqn);
+      if(aopInstance == null)
+         throw new RuntimeException("InternalDelegate.decrementRefCount(): null aopInstance.");
+
+      int count = aopInstance.decrementRefCount();
+
+      if(count < 0)  // can't dip below 0
+         throw new RuntimeException("InternalDelegate.decrementRefCount(): null aopInstance.");
+
+      // need to update it.
+      cache_.put(fqn, AOPInstance.KEY, aopInstance);
+      return count;
+   }
+
+   String getRefFqn(Fqn fqn) throws CacheException {
+      AOPInstance aopInstance = getAopInstance(fqn);
+      if(aopInstance == null)
+         return null;
+
+      return (String)aopInstance.getRefFqn();
+   }
+
+   void setRefFqn(Fqn fqn, String internalFqn) throws CacheException
+   {
+      AOPInstance aopInstance = getAopInstance(fqn);
+      if(aopInstance == null)
+         aopInstance = new AOPInstance();
+
+      aopInstance.setRefFqn(internalFqn);
+      cache_.put(fqn, AOPInstance.KEY, aopInstance);
+   }
+
+   void removeRefFqn(Fqn fqn) throws CacheException
+   {
+      AOPInstance aopInstance = getAopInstance(fqn);
+      if(aopInstance == null)
+         throw new RuntimeException("InternalDelegate.getRefFqn(): null aopInstance.");
+
+      aopInstance.removeRefFqn();
+      cache_.put(fqn, AOPInstance.KEY, aopInstance);
+   }
+
+   Object getPojo(Fqn fqn) throws CacheException
+   {
+      AOPInstance aopInstance = getAopInstance(fqn);
+      if(aopInstance == null)
+         return null;
+
+      return aopInstance.get();
+   }
+
+   void setPojo(Fqn fqn, Object pojo) throws CacheException
+   {
+      AOPInstance aopInstance = getAopInstance(fqn);
+      if(aopInstance == null)
+      {
+         aopInstance = new AOPInstance();
+         cache_.put(fqn, AOPInstance.KEY, aopInstance);
+      }
+
+      aopInstance.set(pojo);
+      // No need to do a cache put since pojo is transient anyway.
+   }
+
+   /**
+    * We store the class name in string.
+    */
+   void putAopClazz(Fqn fqn, Class clazz) throws CacheException {
+      cache_.put(fqn, CLASS_INTERNAL, clazz);
+   }
+
+   Class peekAopClazz(Fqn fqn) throws CacheException {
+      return (Class)cache_.get(fqn, CLASS_INTERNAL);
+   }
+
+   public static boolean isInternalNode(Fqn fqn)
+   {
+     if(fqn.isChildOf(JBOSS_INTERNAL)) return true;
+     return false;
+   }
+
+   // TODO Need to mangle the name to obtain uniqueness?
+   Fqn createInternalNode(Fqn storedFqn)
+   {
+      Fqn fqn = new Fqn(JBOSS_INTERNAL, storedFqn);
+      return fqn;
+   }
+
+   public boolean isAopNode(Fqn fqn) throws CacheException
+   {
+      // We use REF_COUNT as a marker to denote aop node now.
+      if( cache_.peek(fqn, AOPInstance.KEY) != null )
+         return true;
+      else
+         return false;
+   }
+
+}

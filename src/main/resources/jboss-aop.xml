@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<aop>
+   <!-- This is declaration file for annotation. We are using JDK1.4 now,
+        so an annotationc pre-compiler is needed for JBossAop. 
+        See build.xml target annoc for details.
+        Idea is user will then need only to annotate like:
+        @@org.jboss.cache.aop.AopMarker
+        in his POJO. There will be no need of jboss-aop.xml from user's side.
+        Only extra step is annotation compiling. And in JDK1.5, this step
+        will not be needed since the implicit annotation support.
+
+        For example, see either Address or Person.
+   -->
+
+   <!-- If a POJO has AopMarker annotation, it will be asepctized. -->
+   <prepare expr="field(* @org.jboss.cache.aop.AopMarker->*)" />
+
+   <!--
+   Supports inheritance and polymorphism. It can either be a concrete class
+   or an interface. All sub-classes or interface implementors will be instrumeneted.
+   -->
+   <prepare expr="field(* $instanceof{@org.jboss.cache.aop.InstanceOfAopMarker}->*)" />
+
+
+   <!-- This is declaration file for JDK50 annotation.
+        Idea is user will then need only to annotate like:
+        @org.jboss.cache.aop.annotation.PojoCacheable
+        in his POJO. There will be no need of jboss-aop.xml from user's side.
+
+        For example, see either Address or Person.
+   -->
+
+   <!-- If a POJO has PojoCachable annotation, it will be asepctized. -->
+   <prepare expr="field(* @org.jboss.cache.aop.annotation.PojoCacheable->*)" />
+
+   <!--
+   Supports inheritance and polymorphism. It can either be a concrete class
+   or an interface. All sub-classes or interface implementors will be instrumeneted.
+   -->
+   <prepare expr="field(* $instanceof{@org.jboss.cache.aop.annotation.InstanceOfPojoCacheable}->*)" />
+</aop>

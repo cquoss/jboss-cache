@@ -1,0 +1,305 @@
+/*
+ * JBoss, Home of Professional Open Source
+ *
+ * Distributable under LGPL license.
+ * See terms of license at gnu.org.
+ */
+
+package org.jboss.cache.aop.old;
+
+import org.jboss.cache.Fqn;
+import org.jboss.cache.CacheException;
+import org.jboss.aop.advice.Interceptor;
+import org.jboss.aop.proxy.ClassProxy;
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+
+/**
+ * Handle the object graph management.
+ *
+ * @author Ben Wang
+ *         Date: Aug 4, 2005
+ * @version $Id: ObjectGraphHandler.java.old 374 2005-08-07 18:50:22Z bwang $
+ */
+public class ObjectGraphHandler {
+   protected TreeCacheAop cache_;
+   protected InternalDelegate internal_;
+   protected final static Log log=LogFactory.getLog(ObjectGraphHandler.class);
+   protected TreeCacheAopDelegate delegate_;
+
+   public ObjectGraphHandler(TreeCacheAop cache, InternalDelegate internal, TreeCacheAopDelegate delegate)
+   {
+      cache_ = cache;
+      internal_ = internal;
+      delegate_ = delegate;
+   }
+
+   Object objectGraphGet(Fqn fqn) throws CacheException
+   {
+      String refFqn = internal_.getRefFqn(fqn);
+      Object obj;
+      if (refFqn != null) {
+         // this is recursive. Need to obtain the object from parent fqn
+         // No need to add CacheInterceptor as a result. Everything is re-directed.
+         // In addition, this op will not be recursive.
+         if (log.isDebugEnabled()) {
+            log.debug("getObject(): obtain value from reference fqn: " + refFqn);
+         }
+         obj = cache_.getObject(refFqn);
+         if(obj == null)
+            throw new RuntimeException("ObjectGraphHandler.objectGraphGet(): null object from internal ref node." +
+                    " Original fqn: " +fqn + " Internal ref node: " +refFqn);
+
+         return obj; // No need to set the instance under fqn. It is located in refFqn anyway.
+      }
+
+      return null;
+   }
+
+
+   /**
+    *  Check for circular reference. If there is one, we will remove any object from current fqn (if any),
+    * and then put a reference internal fqn in the AOPInstance in the current fqn.
+    */
+   boolean handleCircularReference(Fqn fqn, Interceptor interceptor, Object obj, CachedType type)
+      throws CacheException
+   {
+      Fqn internalFqn;
+      if ((internalFqn = checkCircularReference(fqn, interceptor, obj)) != null) {
+         // 1. Remove existing one, if there is any. It could have an existing node if we are over-writing.
+         //  2. set the ref fqn to the internal one,
+         // 3. put aopInstane in the cache fqn node such that getObject will be redirected to the internal node.
+         cache_.removeObject(fqn);
+         this.handleRefCounting(fqn, internalFqn, true);
+         internal_.putAopClazz(fqn, type.getType());
+         return true;
+      }
+      else {
+         return false;
+      }
+
+   }
+
+   private Fqn checkCircularReference(Fqn fqn, Interceptor interceptor, Object obj)
+   {
+//      if (advisor == null) return null; // this can be a case of non-advised POJO.
+
+      Fqn originalFqn = null;
+      if (interceptor == null) {
+         return null;
+      }
+
+      // ah, found something. So this will be multiple referenced.
+      originalFqn = ((BaseInterceptor) interceptor).getFqn();
+
+      // if it is a circular reference,
+      // we will simply return the fqn associated that
+      // We know it is circular reference because it is the fqn child references back to parent.
+
+      Fqn newFqn = stripFqnInternal(fqn);
+      if (newFqn.isChildOf(originalFqn)) {
+         if (log.isDebugEnabled()) {
+            log.debug("checkCircularReference(): fqn: " + fqn + " is child for circular ref fqn " + originalFqn);
+         }
+         return originalFqn;
+      }
+      return null;
+   }
+
+   /**
+    * If this is an JBossInternal node, need to strip it out first. This is because when a node is moved to
+    * JBossInternal, we should still keep the parent-child relationship.
+    * @param fqn
+    * @return
+    */
+   protected Fqn stripFqnInternal(Fqn fqn)
+   {
+      if(fqn.get(0).equals(InternalDelegate.JBOSS_INTERNAL.get(0)))
+      {
+         return fqn.getFqnChild(1, fqn.size()-1);
+      } else
+      {
+         return fqn;
+      }
+   }
+
+   boolean objectGraphPut(Fqn fqn, Interceptor interceptor, CachedType type, Object obj) throws CacheException
+   {
+      return handleObjectGraph(fqn, interceptor, type, obj);
+   }
+
+   /**
+    * Handle cases where there is circular, e.g., parent refers to child and child to parent, or multiple references,
+    * e.g., two objects reference the same
+    * sub-object. In this case, we will remove the current sub-object and substitue with a ref. The
+    * reference will point to an Jboss internal node where the sub-object is re-created and stored.
+    * It will also have reference counting to keep track of garbage collection.
+    *
+    * @param fqn     Current fqn to store this sub-object
+    * @param interceptor Interceptor
+    * @return The fqn that refers to the sub-object stored in JBoss internal node.
+    */
+   protected boolean handleObjectGraph(Fqn fqn, Interceptor interceptor, CachedType type, Object obj) throws CacheException
+   {
+      if(handleCircularReference(fqn, interceptor, obj, type))
+      {
+         return true;
+      }
+
+      boolean isCollection = false;
+      if(obj instanceof ClassProxy) // TODO This may not be true
+         isCollection = true;
+
+      Fqn internalFqn = obtainObjectGraphInternalFqn(fqn, interceptor, type, obj, isCollection);
+      if(internalFqn == null) return false;
+
+      // Will need to remove the current object under fqn first, if there is any.
+      cache_.removeObject(fqn);
+
+      // This will increment the ref count, reset, and add ref fqn in the current fqn node.
+      this.handleRefCounting(fqn, internalFqn, true);
+      internal_.putAopClazz(fqn, type.getType());
+
+      return true;
+   }
+
+   /**
+    * Produce the internal fqn. Will create one if necessary.
+    * @param fqn
+    * @param interceptor
+    * @param type
+    * @param obj
+    * @return
+    * @throws CacheException
+    */
+   private Fqn obtainObjectGraphInternalFqn(Fqn fqn, Interceptor interceptor, CachedType type, Object obj,
+                                              boolean isCollection) throws CacheException
+   {
+      Fqn originalFqn = null;
+      Fqn internalFqn = null;
+      if (interceptor == null) {
+         if (log.isDebugEnabled()) {
+            log.debug("handleMultipleReference(): No multiple refernce found for fqn: " + fqn);
+         }
+         // Nothing found. Means this is a fresh object. No need to handle.
+         return null;
+      }
+
+      // ah, found something. So this will be multiple referenced.
+      originalFqn = ((BaseInterceptor) interceptor).getFqn();
+       // If we are the same fqn, this is not multiple referenced!
+      // This can be the case when we will reconstruct the node behind the scence.
+      if( fqn.equals(originalFqn) ) return null;
+
+      if (log.isDebugEnabled()) {
+         log.debug("handleObjectGraph(): fqn: " + fqn + " found multiple refernce at original fqn: " + originalFqn);
+      }
+
+      // Check if the reference node locates under JBoss internal already.
+      // Or if it is a circular reference.
+      // If it is, we will simply return the fqn associated that
+      if (internal_.isInternalNode(originalFqn)) {
+         if (log.isDebugEnabled()) {
+            log.debug("handleObjectGraph(): is child for fqn " + originalFqn);
+         }
+
+         // Remove existing one if any
+         cache_.removeObject(fqn);
+         return originalFqn;
+      } else {
+         // If not, we will need to create the sub-object under JBoss internal
+         internalFqn = internal_.createInternalNode(originalFqn);
+         Object oldValue = null;
+
+         if (log.isDebugEnabled()) {
+            log.debug("handleObjectGraph(): Will relocate the original fqn: " + originalFqn +
+                  " to JBossInternal: " + internalFqn);
+         }
+//         if(isCollection)
+//         {  // This must be Collection class now.
+//            individualRemoveAndPut(originalFqn, internalFqn, type, obj);
+//         } else {
+            // Then we will remove the original sub-object node (leaves only AopInstance)
+            oldValue = cache_.removeObject(originalFqn);
+            // Then put it under JBoss internal
+            cache_.putObject(internalFqn, obj);
+//         }
+
+         // Need to call this after putObject so interceptor will be there.
+         // No need to increment the reference counting on the internal node since putObject will do it already.
+         this.handleRefCounting(originalFqn, internalFqn, false);
+         internal_.putAopClazz(originalFqn, type.getType());
+
+         if (log.isDebugEnabled()) {
+            log.debug("handleObjectGraph(): Relocated the original fqn: " + originalFqn +
+                  " to JBossInternal: " + internalFqn + " with obj: " + oldValue);
+         }
+         // Finally, we return with the refFqn.
+         return internalFqn;
+      }
+   }
+
+   void resetRefCount(Fqn fqn) throws CacheException
+   {
+      synchronized(fqn)
+      {
+         internal_.resetRefCount(fqn);
+      }
+   }
+
+   /**
+    * 1. increment reference counter
+    * 2. put in refFqn so we can get it.
+    *
+    * @param fqn The original fqn node
+    * @param refFqn The new internal fqn node
+    */
+   void handleRefCounting(Fqn fqn, Fqn refFqn, boolean incrementCount) throws CacheException {
+      synchronized (refFqn) { // we lock the internal fqn here so no one else has access.
+         // increment the reference counting
+         if(incrementCount)
+            internal_.incrementRefCount(refFqn);
+         // set the internal fqn in fqn so we can reference it.
+         if(log.isTraceEnabled())
+         {
+            log.trace("handleRefCounting(): current fqn: " +fqn + " set to point to: " +refFqn);
+         }
+
+         internal_.setRefFqn(fqn, refFqn.toString());
+      }
+   }
+
+   private void removeRefToInternalFqn(Fqn fqn, String refFqn, boolean removeCacheInterceptor,
+                     boolean evict) throws CacheException {
+      synchronized (refFqn) {  // we lock the internal fqn here so no one else has access.
+         // Decrement ref counting on the internal node
+         if (internal_.decrementRefCount(Fqn.fromString(refFqn)) == 0) {
+            // No one is referring it so it is safe to remove
+            delegate_._removeObject(Fqn.fromString(refFqn), removeCacheInterceptor, evict);
+         }
+      }
+
+      // Remove ref fqn from this fqn
+      internal_.removeRefFqn(fqn);
+   }
+
+   boolean objectGraphRemove(Fqn fqn, boolean removeCacheInterceptor, boolean evict)
+           throws CacheException
+   {
+      boolean isTrue = false;
+
+      String refFqn = internal_.getRefFqn(fqn);
+      // check if this is a refernce
+      if (refFqn != null) {
+         if (log.isDebugEnabled()) {
+            log.debug("removeObject(): removing object fqn: " + fqn + " but is actually from ref fqn: " + refFqn
+            + " Will just de-reference it.");
+         }
+         removeRefToInternalFqn(fqn, refFqn, removeCacheInterceptor, evict);
+         isTrue = true;
+      }
+
+      return isTrue;
+   }
+
+}
